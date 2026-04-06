@@ -52,6 +52,59 @@ CSV file path and backup settings:
 }
 ```
 
+### xero
+
+Settings for Xero export preset:
+
+```json
+{
+  "xero": {
+    "defaultAccountCode": "200",
+    "defaultTaxRate": "23% (VAT on Expenses)"
+  }
+}
+```
+
+### freeagent
+
+Settings for FreeAgent export preset:
+
+```json
+{
+  "freeagent": {
+    "claimantName": ""
+  }
+}
+```
+
+### exportPresets
+
+Custom export format definitions. Each preset maps your ledger fields to a target CSV format:
+
+```json
+{
+  "exportPresets": {
+    "my-accounting": {
+      "columns": ["date", "vendor", "amount"],
+      "headerRow": true,
+      "dateFormat": "%m/%d/%Y",
+      "amountHandling": "positive",
+      "fieldMapping": {
+        "date": "date",
+        "vendor": "vendor",
+        "amount": "total"
+      }
+    }
+  }
+}
+```
+
+- `columns` — ordered list of CSV column headers
+- `headerRow` — whether to include the header row in the output
+- `dateFormat` — Python strftime format for date fields
+- `amountHandling` — `positive` (keep as-is) or `negative` (prefix with minus sign for expenses)
+- `fieldMapping` — maps each CSV column name to the corresponding ledger field name
+
 ---
 
 ## Custom Config

@@ -187,19 +187,84 @@ Users can customize by editing the config. Suggest adding new keywords when a ve
 
 ## 📤 Exporting the Ledger
 
-When the user asks to export, download, or share their expenses:
+Export ledger entries in platform-specific CSV formats for direct import into accounting software.
 
-1. Run `python3 scripts/extract.py ledger view --format csv` to get the CSV content
-2. Save to a temp file if needed
-3. Send as a file attachment using `MEDIA:<path-to-csv>`
-
-Example:
-```
-Here's your expense ledger.
-MEDIA:data/ledger.csv
+```bash
+python3 scripts/extract.py ledger export --platform <name> [filters] [--output FILE]
 ```
 
-The user receives the CSV file which can be imported into accounting software (Xero, FreeAgent, Wave, QuickBooks) or opened in Excel/Google Sheets.
+**Filters:** `--from DATE`, `--to DATE`, `--category CAT`, `--vendor VENDOR`
+
+### Built-in Platforms
+
+| Platform | Use Case | Notes |
+|----------|----------|-------|
+| `xero` | Bills/Expenses import | DD/MM/YYYY dates, includes AccountCode & TaxRate |
+| `freeagent` | Out-of-pocket expenses | No header row, needs `claimantName` in config |
+| `wave` | Bank transactions | Negative amounts for expenses |
+| `generic` | Excel/Google Sheets | Full detail, clean format |
+
+### Examples
+
+```bash
+# Export all entries for Xero
+python3 scripts/extract.py ledger export --platform xero
+
+# Export April expenses to a file
+python3 scripts/extract.py ledger export --platform xero --from 2026-04-01 --to 2026-04-30 --output /tmp/xero-export.csv
+
+# Filter by category for FreeAgent
+python3 scripts/extract.py ledger export --platform freeagent --category travel --output /tmp/freeagent-travel.csv
+```
+
+### Custom Presets
+
+Define custom export formats in `expense-config.json` under `exportPresets`:
+
+```json
+{
+  "exportPresets": {
+    "my-accounting": {
+      "columns": ["date", "vendor", "amount", "category", "notes"],
+      "headerRow": true,
+      "dateFormat": "%m/%d/%Y",
+      "amountHandling": "positive",
+      "fieldMapping": {
+        "date": "date",
+        "vendor": "vendor",
+        "amount": "total",
+        "category": "category",
+        "notes": "description"
+      }
+    }
+  }
+}
+```
+
+The `fieldMapping` maps CSV column names → ledger field names. Use: `--platform my-accounting`
+
+### Sending the File
+
+If no `--output` is specified, CSV goes to stdout. For file attachments:
+
+1. Use `--output /tmp/invoice-export-<platform>-<timestamp>.csv`
+2. Send via `MEDIA:<path-to-csv>`
+
+```
+Here's your Xero import file (12 entries, April 2026).
+MEDIA:/tmp/invoice-export-xero-20260406.csv
+```
+
+### 🔍 Unknown Platform? (LLM Discovery Flow)
+
+If the user names a platform that isn't built-in and isn't in their custom presets:
+
+1. Use `web_search` to find "[platform name] CSV import format expenses"
+2. Identify the required columns and their format
+3. Create a `fieldMapping` from our ledger fields to their columns
+4. Add the preset to the user's `expense-config.json` under `exportPresets`
+5. Tell the user the preset was created and saved
+6. Proceed with the export using the new preset
 
 ---
 
@@ -217,6 +282,7 @@ python3 scripts/extract.py --config /path/to/config.json <command>
 ## ⚠️ Important Notes
 
 - **Always confirm before adding to ledger** — never auto-add extracted data
+- **Duplicate detection** — entries are auto-checked against existing ledger (vendor + date + total hash). Duplicates are skipped with a warning. Use `--force` to override
 - **Dates must be YYYY-MM-DD** — convert if the invoice uses a different format
 - **Currency symbols** — normalize to ISO codes (€ → EUR, £ → GBP, $ → USD)
 - **Backups** — the script automatically backs up the ledger before each write (keeps last 5)

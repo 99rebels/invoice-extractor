@@ -3,16 +3,18 @@
 Invoice Extractor — PDF text extraction, batch file discovery, and CSV ledger management.
 
 Usage:
-    python3 extract.py --pdf <file>
+    python3 extract.py pdf <file>
     python3 extract.py batch <folder>
-    python3 extract.py ledger --add <json-file-or->
-    python3 extract.py ledger --view [--from DATE] [--to DATE] [--category CAT] [--vendor VENDOR] [--format json|csv]
-    python3 extract.py ledger --summary [--period week|month|year]
+    python3 extract.py ledger add <json-file-or->
+    python3 extract.py ledger view [--from DATE] [--to DATE] [--category CAT] [--vendor VENDOR] [--format json|csv]
+    python3 extract.py ledger summary [--period week|month|year]
     python3 extract.py categories
 """
 
 import argparse
 import csv
+import hashlib
+import io
 import json
 import os
 import re
@@ -178,6 +180,7 @@ def batch_scan(folder: str) -> list[dict]:
 LEDGER_HEADERS = [
     "id", "date", "vendor", "description", "category",
     "subtotal", "tax", "total", "currency", "source_file", "extracted_at",
+    "dedup_hash",
 ]
 
 
@@ -231,6 +234,37 @@ def read_ledger(ledger_path: Path) -> list[dict]:
         return []
 
 
+def ensure_ledger_headers(ledger_path: Path):
+    """Ensure the ledger CSV has the latest headers. Returns True if file was migrated."""
+    if not ledger_path.exists():
+        return False
+    try:
+        with open(ledger_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            current_headers = next(reader, None)
+        if current_headers is None:
+            return False
+        # Check if dedup_hash column is missing
+        if "dedup_hash" not in current_headers:
+            # Migrate: rewrite file with new header row
+            backup_count = 5  # default, config not available here
+            backup_ledger(ledger_path, backup_count)
+            rows = []
+            with open(ledger_path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    row["dedup_hash"] = ""
+                    rows.append(row)
+            with open(ledger_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=LEDGER_HEADERS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+            return True
+    except Exception as e:
+        print(f"Warning: could not check ledger headers: {e}", file=sys.stderr)
+    return False
+
+
 def write_ledger_entry(ledger_path: Path, entry: dict, config: dict):
     """Append an entry to the ledger CSV."""
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
@@ -245,7 +279,31 @@ def write_ledger_entry(ledger_path: Path, entry: dict, config: dict):
         writer.writerow(entry)
 
 
-def ledger_add(json_input: str | None, config: dict, source_file: str | None = None):
+def compute_dedup_hash(vendor: str, date: str, total: float) -> str:
+    """Compute a 12-char hex hash for duplicate detection."""
+    payload = f"{vendor}|{date}|{total:.2f}"
+    return hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+
+def load_existing_hashes(ledger_path: Path) -> set[str]:
+    """Load all dedup hashes from existing ledger entries."""
+    hashes = set()
+    if not ledger_path.exists():
+        return hashes
+    try:
+        with open(ledger_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                h = row.get("dedup_hash", "").strip()
+                if h:
+                    hashes.add(h)
+    except Exception:
+        pass
+    return hashes
+
+
+def ledger_add(json_input: str | None, config: dict, source_file: str | None = None,
+              force: bool = False):
     """Add an entry to the ledger from JSON input."""
     # Read JSON
     try:
@@ -277,23 +335,45 @@ def ledger_add(json_input: str | None, config: dict, source_file: str | None = N
         except ValueError:
             continue
 
+    # Normalize total
+    try:
+        total_val = float(data["total"])
+    except (ValueError, TypeError):
+        print(f"Error: invalid total value '{data['total']}'", file=sys.stderr)
+        sys.exit(1)
+
+    vendor_val = str(data["vendor"]).strip()
+
+    # Duplicate detection
+    if not force:
+        ensure_ledger_headers(ledger_path)
+        existing_hashes = load_existing_hashes(ledger_path)
+        new_hash = compute_dedup_hash(vendor_val, date_val, total_val)
+        if new_hash in existing_hashes:
+            print(f"Duplicate detected: {vendor_val} | {date_val} | {total_val:.2f} (hash: {new_hash})", file=sys.stderr)
+            print(f"Entry skipped. Use --force to add anyway.", file=sys.stderr)
+            sys.exit(2)
+    else:
+        new_hash = compute_dedup_hash(vendor_val, date_val, total_val)
+
     # Auto-categorize if not specified
     category = data.get("category") or auto_categorize(
-        data["vendor"], data.get("description", ""), config
+        vendor_val, data.get("description", ""), config
     )
 
     entry = {
         "id": next_id(ledger_path),
         "date": date_val,
-        "vendor": str(data["vendor"]).strip(),
+        "vendor": vendor_val,
         "description": str(data.get("description", "")).strip(),
         "category": category,
         "subtotal": str(data.get("subtotal", "")),
         "tax": str(data.get("tax", "")),
-        "total": str(data["total"]),
+        "total": str(total_val),
         "currency": str(data.get("currency", config.get("defaults", {}).get("currency", "EUR"))),
         "source_file": str(source_file or data.get("source_file", "")),
         "extracted_at": datetime.now(tz=None).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "dedup_hash": new_hash,
     }
 
     write_ledger_entry(ledger_path, entry, config)
@@ -402,6 +482,230 @@ def list_categories(config: dict):
 
 
 # ---------------------------------------------------------------------------
+# Export presets
+# ---------------------------------------------------------------------------
+
+BUILTIN_PRESETS = {
+    "xero": {
+        "columns": ["ContactName", "InvoiceNumber", "InvoiceDate", "DueDate",
+                     "Description", "Quantity", "UnitAmount", "AccountCode", "TaxRate"],
+        "headerRow": True,
+        "dateFormat": "%d/%m/%Y",
+        "amountHandling": "positive",
+        "transform": "xero",
+    },
+    "freeagent": {
+        "columns": ["claimant_name", "category", "date", "currency", "value", "description"],
+        "headerRow": False,
+        "dateFormat": "%d/%m/%Y",
+        "amountHandling": "positive",
+        "transform": "freeagent",
+    },
+    "wave": {
+        "columns": ["Date", "Description", "Amount"],
+        "headerRow": True,
+        "dateFormat": "%Y-%m-%d",
+        "amountHandling": "negative",
+        "transform": "wave",
+    },
+    "generic": {
+        "columns": ["Date", "Vendor", "Description", "Category", "Subtotal", "Tax", "Total", "Currency"],
+        "headerRow": True,
+        "dateFormat": "%Y-%m-%d",
+        "amountHandling": "positive",
+        "transform": "generic",
+    },
+}
+
+# FreeAgent category mapping
+FREEAGENT_CATEGORY_MAP = {
+    "software": "Software",
+    "travel": "Travel",
+    "office": "Office Costs",
+    "utilities": "Business Costs",
+    "food": "Entertaining",
+    "professional": "Legal and Professional Fees",
+    "marketing": "Marketing",
+    "uncategorized": "General Expenses",
+}
+
+
+def load_export_preset(platform: str, config: dict) -> dict:
+    """Load a preset: custom from config first, then built-in."""
+    # Check custom presets
+    custom = config.get("exportPresets", {}).get(platform)
+    if custom:
+        return custom
+    # Check built-in
+    builtin = BUILTIN_PRESETS.get(platform)
+    if builtin:
+        return builtin
+    # Not found
+    available = list(config.get("exportPresets", {}).keys()) + list(BUILTIN_PRESETS.keys())
+    print(f"Error: unknown platform '{platform}'. Available: {', '.join(sorted(available))}", file=sys.stderr)
+    sys.exit(1)
+
+
+def format_date(date_str: str, target_fmt: str) -> str:
+    """Convert a YYYY-MM-DD date string to the target format."""
+    if not date_str:
+        return ""
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return dt.strftime(target_fmt)
+    except ValueError:
+        return date_str
+
+
+def transform_row(row: dict, preset: dict, config: dict) -> list[str]:
+    """Transform a ledger row into CSV columns according to the preset."""
+    # Detect custom preset (has fieldMapping) vs built-in (has transform key)
+    if "fieldMapping" in preset:
+        transform = "custom"
+    else:
+        transform = preset.get("transform", "generic")
+    date_fmt = preset.get("dateFormat", "%Y-%m-%d")
+    amount_handling = preset.get("amountHandling", "positive")
+
+    if transform == "xero":
+        account_code = config.get("xero", {}).get("defaultAccountCode", "200")
+        tax_rate = config.get("xero", {}).get("defaultTaxRate", "23% (VAT on Expenses)")
+        total = float(row.get("total", 0) or 0)
+        return [
+            row.get("vendor", ""),
+            row.get("id", ""),
+            format_date(row.get("date", ""), date_fmt),
+            format_date(row.get("date", ""), date_fmt),  # DueDate same as date if not available
+            row.get("description", ""),
+            "1",
+            f"{total:.2f}",
+            account_code,
+            tax_rate,
+        ]
+
+    elif transform == "freeagent":
+        claimant = config.get("freeagent", {}).get("claimantName", "")
+        cat = row.get("category", "uncategorized")
+        fa_cat = FREEAGENT_CATEGORY_MAP.get(cat, "General Expenses")
+        total = float(row.get("total", 0) or 0)
+        return [
+            claimant,
+            fa_cat,
+            format_date(row.get("date", ""), date_fmt),
+            row.get("currency", "EUR"),
+            f"{total:.2f}",
+            row.get("description", ""),
+        ]
+
+    elif transform == "wave":
+        total = float(row.get("total", 0) or 0)
+        amount = f"-{total:.2f}" if amount_handling == "negative" else f"{total:.2f}"
+        return [
+            format_date(row.get("date", ""), date_fmt),
+            row.get("description", ""),
+            amount,
+        ]
+
+    elif transform == "custom":
+        # Custom preset with fieldMapping
+        field_mapping = preset.get("fieldMapping", {})
+        result = []
+        for col in preset.get("columns", []):
+            ledger_field = field_mapping.get(col, col)
+            val = row.get(ledger_field, "")
+            # Format date fields
+            if ledger_field == "date" and val:
+                val = format_date(val, date_fmt)
+            # Handle amount fields
+            if ledger_field == "total" and val:
+                total = float(val)
+                if amount_handling == "negative":
+                    val = f"-{total:.2f}"
+                else:
+                    val = f"{total:.2f}"
+            result.append(str(val))
+        return result
+
+    else:  # generic
+        subtotal = float(row.get("subtotal", 0) or 0)
+        tax = float(row.get("tax", 0) or 0)
+        total = float(row.get("total", 0) or 0)
+        return [
+            format_date(row.get("date", ""), date_fmt),
+            row.get("vendor", ""),
+            row.get("description", ""),
+            row.get("category", ""),
+            f"{subtotal:.2f}",
+            f"{tax:.2f}",
+            f"{total:.2f}",
+            row.get("currency", "EUR"),
+        ]
+
+
+def filter_rows(rows: list[dict], from_date: str = None, to_date: str = None,
+                category: str = None, vendor: str = None) -> list[dict]:
+    """Apply filters to ledger rows."""
+    from_dt = parse_date_filter(from_date)
+    to_dt = parse_date_filter(to_date)
+
+    filtered = []
+    for row in rows:
+        if from_dt or to_dt:
+            row_date = parse_date_filter(row.get("date", ""))
+            if row_date:
+                if from_dt and row_date < from_dt:
+                    continue
+                if to_dt and row_date > to_dt + timedelta(days=1) - timedelta(seconds=1):
+                    continue
+        if category and row.get("category", "").lower() != category.lower():
+            continue
+        if vendor and vendor.lower() not in row.get("vendor", "").lower():
+            continue
+        filtered.append(row)
+    return filtered
+
+
+def ledger_export(config: dict, platform: str, from_date: str = None,
+                  to_date: str = None, category: str = None, vendor: str = None,
+                  output: str = None):
+    """Export ledger entries in a platform-specific CSV format."""
+    preset = load_export_preset(platform, config)
+
+    ledger_path = resolve_ledger_path(config)
+    rows = read_ledger(ledger_path)
+
+    if not rows:
+        print("No entries in ledger.", file=sys.stderr)
+        sys.exit(1)
+
+    filtered = filter_rows(rows, from_date, to_date, category, vendor)
+
+    if not filtered:
+        print("No entries match the specified filters.", file=sys.stderr)
+        sys.exit(1)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+
+    if preset.get("headerRow", True):
+        writer.writerow(preset.get("columns", []))
+
+    for row in filtered:
+        writer.writerow(transform_row(row, preset, config))
+
+    csv_content = buf.getvalue()
+
+    if output:
+        out_path = Path(output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8", newline="") as f:
+            f.write(csv_content)
+        print(f"Exported {len(filtered)} entries to {out_path}", file=sys.stderr)
+    else:
+        sys.stdout.write(csv_content)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -425,10 +729,20 @@ def main():
     ledger_parser = subparsers.add_parser("ledger", help="Manage expense ledger")
     ledger_sub = ledger_parser.add_subparsers(dest="ledger_command")
 
-    # ledger --add
+    # ledger add
     add_parser = ledger_sub.add_parser("add", help="Add entry to ledger")
     add_parser.add_argument("json_file", nargs="?", help="JSON file path (or - for stdin)")
     add_parser.add_argument("--source", help="Source filename for the entry")
+    add_parser.add_argument("--force", action="store_true", help="Skip duplicate detection")
+
+    # ledger export
+    export_parser = ledger_sub.add_parser("export", help="Export ledger to platform CSV")
+    export_parser.add_argument("--platform", required=True, help="Target platform (xero, freeagent, wave, generic, or custom)")
+    export_parser.add_argument("--from", dest="from_date", help="Filter from date (YYYY-MM-DD)")
+    export_parser.add_argument("--to", dest="to_date", help="Filter to date (YYYY-MM-DD)")
+    export_parser.add_argument("--category", help="Filter by category")
+    export_parser.add_argument("--vendor", help="Filter by vendor (partial match)")
+    export_parser.add_argument("--output", help="Output file path (default: stdout)")
 
     # ledger --view
     view_parser = ledger_sub.add_parser("view", help="View ledger entries")
@@ -457,11 +771,14 @@ def main():
         print(json.dumps(files, indent=2))
     elif args.command == "ledger":
         if args.ledger_command == "add":
-            ledger_add(args.json_file, config, args.source)
+            ledger_add(args.json_file, config, args.source, force=args.force)
         elif args.ledger_command == "view":
             ledger_view(config, args.from_date, args.to_date, args.category, args.vendor, args.format)
         elif args.ledger_command == "summary":
             ledger_summary(config, args.period)
+        elif args.ledger_command == "export":
+            ledger_export(config, args.platform, args.from_date, args.to_date,
+                          args.category, args.vendor, args.output)
         else:
             ledger_parser.print_help()
     elif args.command == "categories":
