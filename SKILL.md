@@ -137,6 +137,32 @@ python3 scripts/extract.py ledger view [filters]
 --format json|csv Output format (default: json)
 ```
 
+**Edit an entry:**
+
+```bash
+python3 scripts/extract.py ledger edit --id N --vendor "New Name"
+python3 scripts/extract.py ledger edit --id N --total 250.00 --category software
+python3 scripts/extract.py ledger edit --id N --date 2026-04-02
+```
+
+Editable fields: `--vendor`, `--total`, `--date`, `--description`, `--category`, `--currency`, `--subtotal`, `--tax`. Multiple fields in one command. Auto-recalculates the dedup hash.
+
+**Delete an entry:**
+
+```bash
+python3 scripts/extract.py ledger delete --id N
+```
+
+Removes the entry, renumbers remaining IDs, creates a backup.
+
+**Undo last add:**
+
+```bash
+python3 scripts/extract.py ledger undo
+```
+
+Removes the most recently added entry (highest ID). One-level undo only.
+
 **Category summaries:**
 
 ```bash
@@ -288,3 +314,46 @@ python3 scripts/extract.py --config /path/to/config.json <command>
 - **Backups** — the script automatically backs up the ledger before each write (keeps last 5)
 
 For edge cases (encrypted PDFs, scanned/image-only PDFs, dependency errors), see [references/notes.md](references/notes.md).
+
+---
+
+## Edge Cases
+
+### Ambiguous Dates
+
+- "03/04/2026" is ambiguous (March 4 US, April 3 EU)
+- If the invoice doesn't specify a format, check the config `defaults.dateFormat`
+- If still unclear, ask the user: "Is this March 4th or April 3rd?"
+- Common formats: DD/MM/YYYY (Ireland, UK, EU), MM/DD/YYYY (US), YYYY-MM-DD (ISO — always prefer this)
+
+### Missing Fields
+
+- If no invoice number: leave blank in JSON, the script handles it
+- If no line items: just use the description field
+- If no tax breakdown: set tax to 0 and note "tax not specified"
+- If no currency: use the config default (EUR)
+- If no vendor name but there's a company logo in the image: best effort from context
+- Always show the user what was extracted — even incomplete data — and let them confirm or edit
+
+### Credit Notes and Refunds
+
+- Negative totals indicate a credit/refund
+- Still add to ledger — negative entries are valid expenses (they reduce totals)
+- Category as normal based on vendor
+- In the confirmation prompt, note it's a credit: "⚠️ Credit note detected (negative total)"
+
+### Multi-page PDFs
+
+- pdfplumber extracts text from all pages into one output
+- The LLM sees all text and can find totals on any page
+- No special handling needed — it just works
+
+### Non-invoice PDFs
+
+- If the extracted text doesn't look like an invoice (no vendor, no amounts, no date), tell the user: "This doesn't appear to be an invoice or receipt. Want to skip it?"
+- Don't force extraction on something that clearly isn't an invoice
+
+### Very Small Receipts
+
+- Coffee receipts, parking tickets — often low-quality images or tiny text
+- The LLM should still attempt extraction but flag low confidence: "⚠️ Low confidence — please verify the amounts"

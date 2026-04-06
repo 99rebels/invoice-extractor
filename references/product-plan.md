@@ -137,6 +137,15 @@ invoice-extractor/
 
 ## Changelog
 
+### v1.2.1 — Bulletproofing
+- `ledger delete --id N` — remove entries with ID renumbering
+- `ledger edit --id N` — update fields with auto hash recalculation
+- `ledger undo` — remove last entry (one-level undo)
+- CSV quoting safety (explicit `csv.QUOTE_MINIMAL` on all writers)
+- `write_ledger_all()` helper for full-rewrite operations
+- Edge case guidance in SKILL.md (ambiguous dates, missing fields, credit notes, non-invoices)
+- Config `dateFormat` now uses display format (DD/MM/YYYY) instead of Python strftime
+
 ### v1.2 — Duplicate Detection
 - Hash-based duplicate detection on `ledger add` (vendor + date + total → SHA-256[:12])
 - `dedup_hash` column added to ledger CSV

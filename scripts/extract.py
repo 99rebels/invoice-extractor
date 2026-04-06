@@ -6,8 +6,12 @@ Usage:
     python3 extract.py pdf <file>
     python3 extract.py batch <folder>
     python3 extract.py ledger add <json-file-or->
+    python3 extract.py ledger edit --id N [--vendor V] [--total T] [--date D] ...
+    python3 extract.py ledger delete --id N
+    python3 extract.py ledger undo
     python3 extract.py ledger view [--from DATE] [--to DATE] [--category CAT] [--vendor VENDOR] [--format json|csv]
     python3 extract.py ledger summary [--period week|month|year]
+    python3 extract.py ledger export --platform <name> [filters]
     python3 extract.py categories
 """
 
@@ -39,7 +43,7 @@ DEFAULT_CONFIG = {
     "defaults": {
         "currency": "EUR",
         "taxRate": 0.23,
-        "dateFormat": "%Y-%m-%d",
+        "dateFormat": "DD/MM/YYYY",
     },
     "ledger": {
         "path": "data/ledger.csv",
@@ -256,7 +260,8 @@ def ensure_ledger_headers(ledger_path: Path):
                     row["dedup_hash"] = ""
                     rows.append(row)
             with open(ledger_path, "w", encoding="utf-8", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=LEDGER_HEADERS, extrasaction="ignore")
+                writer = csv.DictWriter(f, fieldnames=LEDGER_HEADERS, extrasaction="ignore",
+                                        quoting=csv.QUOTE_MINIMAL)
                 writer.writeheader()
                 writer.writerows(rows)
             return True
@@ -273,10 +278,24 @@ def write_ledger_entry(ledger_path: Path, entry: dict, config: dict):
 
     file_exists = ledger_path.exists()
     with open(ledger_path, "a", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=LEDGER_HEADERS, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=LEDGER_HEADERS, extrasaction="ignore",
+                                quoting=csv.QUOTE_MINIMAL)
         if not file_exists:
             writer.writeheader()
         writer.writerow(entry)
+
+
+def write_ledger_all(ledger_path: Path, rows: list[dict], config: dict):
+    """Rewrite the entire ledger CSV with the given rows."""
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_count = config.get("ledger", {}).get("backupCount", 5)
+    backup_ledger(ledger_path, backup_count)
+
+    with open(ledger_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=LEDGER_HEADERS, extrasaction="ignore",
+                                quoting=csv.QUOTE_MINIMAL)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def compute_dedup_hash(vendor: str, date: str, total: float) -> str:
@@ -302,6 +321,19 @@ def load_existing_hashes(ledger_path: Path) -> set[str]:
     return hashes
 
 
+def normalize_date(date_str: str, config: dict) -> str:
+    """Normalize a date string to YYYY-MM-DD format."""
+    date_val = str(date_str)
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y", "%Y/%m/%d",
+                "%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y"):
+        try:
+            return datetime.strptime(date_val, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    # If we can't parse it, return as-is (validation will catch bad dates elsewhere)
+    return date_val
+
+
 def ledger_add(json_input: str | None, config: dict, source_file: str | None = None,
               force: bool = False):
     """Add an entry to the ledger from JSON input."""
@@ -325,15 +357,7 @@ def ledger_add(json_input: str | None, config: dict, source_file: str | None = N
     ledger_path = resolve_ledger_path(config)
 
     # Normalize date
-    date_fmt = config.get("defaults", {}).get("dateFormat", "%Y-%m-%d")
-    date_val = str(data["date"])
-    # Try to parse common formats and normalize to YYYY-MM-DD
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y", "%Y/%m/%d", "%d %b %Y", "%d %B %Y"):
-        try:
-            date_val = datetime.strptime(date_val, fmt).strftime("%Y-%m-%d")
-            break
-        except ValueError:
-            continue
+    date_val = normalize_date(data["date"], config)
 
     # Normalize total
     try:
@@ -380,6 +404,120 @@ def ledger_add(json_input: str | None, config: dict, source_file: str | None = N
     print(json.dumps(entry, indent=2))
 
 
+def ledger_delete(config: dict, entry_id: int):
+    """Delete a ledger entry by ID. Renumbers remaining IDs."""
+    ledger_path = resolve_ledger_path(config)
+    rows = read_ledger(ledger_path)
+
+    if not rows:
+        print("No entries in ledger.", file=sys.stderr)
+        sys.exit(1)
+
+    # Find the entry
+    target_idx = None
+    for i, row in enumerate(rows):
+        if row.get("id", "").strip() == str(entry_id):
+            target_idx = i
+            break
+
+    if target_idx is None:
+        print(f"Error: no entry with ID {entry_id} found.", file=sys.stderr)
+        sys.exit(1)
+
+    deleted = rows.pop(target_idx)
+
+    # Renumber remaining IDs sequentially
+    for i, row in enumerate(rows):
+        row["id"] = str(i + 1)
+
+    write_ledger_all(ledger_path, rows, config)
+
+    # Print what was removed
+    print(f"Deleted entry ID {entry_id}:")
+    print(json.dumps(deleted, indent=2))
+
+
+def ledger_edit(config: dict, entry_id: int, updates: dict):
+    """Edit fields of a ledger entry by ID. Recalculates dedup_hash."""
+    ledger_path = resolve_ledger_path(config)
+    rows = read_ledger(ledger_path)
+
+    if not rows:
+        print("No entries in ledger.", file=sys.stderr)
+        sys.exit(1)
+
+    # Find the entry
+    target_idx = None
+    for i, row in enumerate(rows):
+        if row.get("id", "").strip() == str(entry_id):
+            target_idx = i
+            break
+
+    if target_idx is None:
+        print(f"Error: no entry with ID {entry_id} found.", file=sys.stderr)
+        sys.exit(1)
+
+    entry = rows[target_idx]
+
+    # Apply updates
+    editable_fields = {"vendor", "total", "date", "description", "category",
+                       "currency", "subtotal", "tax"}
+    applied = {}
+    for field, value in updates.items():
+        if field not in editable_fields:
+            print(f"Warning: unknown field '{field}', skipping.", file=sys.stderr)
+            continue
+        entry[field] = str(value).strip()
+        applied[field] = entry[field]
+
+    # Normalize date if it was changed
+    if "date" in applied:
+        entry["date"] = normalize_date(entry["date"], config)
+
+    # Recalculate dedup_hash (vendor/date/total may have changed)
+    vendor = entry.get("vendor", "")
+    date = entry.get("date", "")
+    try:
+        total = float(entry.get("total", 0) or 0)
+    except (ValueError, TypeError):
+        total = 0.0
+    entry["dedup_hash"] = compute_dedup_hash(vendor, date, total)
+
+    write_ledger_all(ledger_path, rows, config)
+
+    print(f"Updated entry ID {entry_id} ({', '.join(applied.keys())}):")
+    print(json.dumps(entry, indent=2))
+
+
+def ledger_undo(config: dict):
+    """Remove the most recently added entry (highest ID). One-level undo only."""
+    ledger_path = resolve_ledger_path(config)
+    rows = read_ledger(ledger_path)
+
+    if not rows:
+        print("No entries in ledger.", file=sys.stderr)
+        sys.exit(1)
+
+    # Find the last entry (highest ID)
+    last_idx = 0
+    last_id = -1
+    for i, row in enumerate(rows):
+        try:
+            rid = int(row.get("id", "0"))
+        except ValueError:
+            rid = 0
+        if rid > last_id:
+            last_id = rid
+            last_idx = i
+
+    removed = rows.pop(last_idx)
+
+    write_ledger_all(ledger_path, rows, config)
+
+    print(f"Undone (removed last entry, was ID {last_id}):")
+    print(json.dumps(removed, indent=2))
+
+
 def parse_date_filter(date_str: str) -> datetime | None:
     """Parse a date filter string into a datetime."""
     if not date_str:
@@ -424,7 +562,8 @@ def ledger_view(config: dict, from_date: str = None, to_date: str = None,
         filtered.append(row)
 
     if fmt == "csv":
-        writer = csv.DictWriter(sys.stdout, fieldnames=LEDGER_HEADERS, extrasaction="ignore")
+        writer = csv.DictWriter(sys.stdout, fieldnames=LEDGER_HEADERS, extrasaction="ignore",
+                                quoting=csv.QUOTE_MINIMAL)
         writer.writeheader()
         for row in filtered:
             writer.writerow(row)
@@ -575,7 +714,7 @@ def transform_row(row: dict, preset: dict, config: dict) -> list[str]:
             row.get("vendor", ""),
             row.get("id", ""),
             format_date(row.get("date", ""), date_fmt),
-            format_date(row.get("date", ""), date_fmt),  # DueDate same as date if not available
+            format_date(row.get("dueDate", ""), date_fmt) or format_date(row.get("date", ""), date_fmt),
             row.get("description", ""),
             "1",
             f"{total:.2f}",
@@ -685,7 +824,7 @@ def ledger_export(config: dict, platform: str, from_date: str = None,
         sys.exit(1)
 
     buf = io.StringIO()
-    writer = csv.writer(buf)
+    writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
 
     if preset.get("headerRow", True):
         writer.writerow(preset.get("columns", []))
@@ -735,6 +874,25 @@ def main():
     add_parser.add_argument("--source", help="Source filename for the entry")
     add_parser.add_argument("--force", action="store_true", help="Skip duplicate detection")
 
+    # ledger edit
+    edit_parser = ledger_sub.add_parser("edit", help="Edit a ledger entry")
+    edit_parser.add_argument("--id", type=int, required=True, help="Entry ID to edit")
+    edit_parser.add_argument("--vendor", help="New vendor name")
+    edit_parser.add_argument("--total", help="New total amount")
+    edit_parser.add_argument("--date", help="New date (YYYY-MM-DD)")
+    edit_parser.add_argument("--description", help="New description")
+    edit_parser.add_argument("--category", help="New category")
+    edit_parser.add_argument("--currency", help="New currency code")
+    edit_parser.add_argument("--subtotal", help="New subtotal")
+    edit_parser.add_argument("--tax", help="New tax amount")
+
+    # ledger delete
+    delete_parser = ledger_sub.add_parser("delete", help="Delete a ledger entry")
+    delete_parser.add_argument("--id", type=int, required=True, help="Entry ID to delete")
+
+    # ledger undo
+    ledger_sub.add_parser("undo", help="Remove the last entry (one-level undo)")
+
     # ledger export
     export_parser = ledger_sub.add_parser("export", help="Export ledger to platform CSV")
     export_parser.add_argument("--platform", required=True, help="Target platform (xero, freeagent, wave, generic, or custom)")
@@ -772,6 +930,21 @@ def main():
     elif args.command == "ledger":
         if args.ledger_command == "add":
             ledger_add(args.json_file, config, args.source, force=args.force)
+        elif args.ledger_command == "edit":
+            updates = {}
+            for field in ("vendor", "total", "date", "description", "category",
+                          "currency", "subtotal", "tax"):
+                val = getattr(args, field, None)
+                if val is not None:
+                    updates[field] = val
+            if not updates:
+                print("Error: no fields specified to edit. Use --vendor, --total, --date, etc.", file=sys.stderr)
+                sys.exit(1)
+            ledger_edit(config, args.id, updates)
+        elif args.ledger_command == "delete":
+            ledger_delete(config, args.id)
+        elif args.ledger_command == "undo":
+            ledger_undo(config)
         elif args.ledger_command == "view":
             ledger_view(config, args.from_date, args.to_date, args.category, args.vendor, args.format)
         elif args.ledger_command == "summary":

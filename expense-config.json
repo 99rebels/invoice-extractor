@@ -104,7 +104,7 @@
   "defaults": {
     "currency": "EUR",
     "taxRate": 0.23,
-    "dateFormat": "%Y-%m-%d"
+    "dateFormat": "DD/MM/YYYY"
   },
   "ledger": {
     "path": "data/ledger.csv",
