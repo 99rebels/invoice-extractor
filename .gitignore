@@ -1,0 +1,5 @@
+data/ledger.csv
+data/ledger.csv.bak.*
+__pycache__/
+*.pyc
+.DS_Store
